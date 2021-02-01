@@ -21,10 +21,6 @@
 #include <netinet/ip_icmp.h>
 #include <netinet/udp.h>
 
-//#include <sys/cdefs.h>
-//#include <sys/types.h>
-//#include <linux/ip.h>
-
 #include "crc.c"
 
 #define MAX_HOPS 30
@@ -37,7 +33,7 @@ struct trace_span {
 };
 
 int get_if_addr(const char *if_name, struct in_addr *src) {
-    printf("Using networking interface %s\n", if_name);
+    printf("using networking interface %s\n", if_name);
 
     struct ifaddrs *addrs;
     getifaddrs(&addrs);
@@ -73,7 +69,7 @@ int hostname_to_ip(char *hostname, struct in_addr *dest) {
     addr_list = (struct in_addr **) he->h_addr_list;
 
     for (unsigned int i = 0; addr_list[i] != NULL; i++) {
-        //Return the first one;
+        // return the first one;
         *dest = *addr_list[i];
         return 0;
     }
@@ -110,7 +106,7 @@ char *build_span(const struct trace_span *span) {
     icmphd->checksum = GNUNET_CRYPTO_crc16_n((unsigned short *) (packet + sizeof(struct iphdr)),
                                              sizeof(struct icmphdr));
 
-    // Calculate full checksumn
+    // calculate full checksum
     iph->check = GNUNET_CRYPTO_crc16_n((unsigned short *) packet, sizeof(struct iphdr) + sizeof(struct icmphdr));
 
     // create UDP header
@@ -125,10 +121,84 @@ char *build_span(const struct trace_span *span) {
     return packet;
 }
 
+int trace(int out_sock, int in_sock, struct in_addr *src, struct in_addr *dest) {
+    // build traceroute span
+    struct trace_span span;
+    span.src = src;
+    span.dest = dest;
+
+    // destination socket address
+    struct sockaddr_in dest_sockaddr;
+    dest_sockaddr.sin_family = AF_INET;
+    dest_sockaddr.sin_addr.s_addr = dest->s_addr;
+    dest_sockaddr.sin_port = htons(80);
+
+    // initialize ignored hop count for localhosts
+    uint8_t ignored = 0;
+
+    // initialize ip (hop) lookup struct
+    struct sockaddr_in h_lkp;
+    memset(&h_lkp, 0, sizeof(h_lkp));
+    h_lkp.sin_family = AF_INET;
+
+    for (uint8_t i = 0; i < MAX_HOPS; i++) {
+        // upgrade span, create packet
+        span.ttl = i + 1;
+        char *packet = build_span(&span);
+
+        // send span
+        ssize_t dat = sendto(out_sock, packet, sizeof(struct iphdr) + sizeof(struct icmphdr) + sizeof(struct udphdr), 0,
+                             (struct sockaddr *) &dest_sockaddr, sizeof dest_sockaddr);
+
+        // free assigned packet memory
+        free(packet);
+
+        // receive answer
+        struct sockaddr_in receiver;
+        socklen_t sockaddr_size = sizeof(receiver);
+        char buf[sizeof(struct iphdr) + sizeof(struct icmphdr)];
+        recvfrom(in_sock, buf, sizeof(struct iphdr) + sizeof(struct icmphdr), 0, (struct sockaddr *) &receiver,
+                 &sockaddr_size);
+        struct iphdr *ip = (struct iphdr *) buf;
+        struct icmphdr *icmp = (struct icmphdr *) (buf + sizeof(struct iphdr));
+
+        // "translate" response ip
+        char res_ip[15];
+        inet_ntop(AF_INET, &ip->saddr, res_ip, sizeof(res_ip));
+
+        // check loopback resolves, ignore "hop"
+        if (0 == strcmp((char *) &res_ip, "127.0.0.1")) {
+            ignored++;
+            continue;
+        }
+
+        // lookup hostname by response ip
+        h_lkp.sin_addr.s_addr = ip->saddr;
+
+        static char hostname[64];
+        if (0 != getnameinfo((struct sockaddr *) &h_lkp, sizeof(h_lkp), hostname, sizeof(hostname), NULL, 0, 0)) {
+            strcpy(hostname, "*");
+        }
+
+        // print span
+        printf("hop %d - [%s]: %s\n", span.ttl - ignored, hostname, res_ip);
+
+        // check for trace completion, terminate loop
+        if (0 == memcmp(&dest, &ip->saddr, sizeof(struct in_addr))) {
+            printf("trace completed!\n");
+            return 0;
+        }
+    }
+
+    fprintf(stderr, "unable to complete trace in %d hops!\n", MAX_HOPS);
+
+    return 1;
+}
+
 int main(int argc, char **argv) {
     // argument check
     if (argc < 2) {
-        fprintf(stderr, "Illegal use of traceroute: ./traceroute [DESTINATION_DOMAIN] [NETWORKING_INTERFACE=eth0].\n");
+        fprintf(stderr, "illegal use of traceroute: ./traceroute [DESTINATION_DOMAIN] [NETWORKING_INTERFACE=eth0].\n");
         return 1;
     }
 
@@ -142,20 +212,21 @@ int main(int argc, char **argv) {
     }
 
     if (0 != src_check) {
-        fprintf(stderr, "Cannot find networking interface!\n");
+        fprintf(stderr, "cannot find networking interface!\n");
         return 1;
     }
 
+    // print readable src ip
     char if_ip[15];
     inet_ntop(AF_INET, &src, if_ip, sizeof(if_ip));
-    printf("Will fire from networking interface %s\n", if_ip);
+    printf("will fire from networking interface %s\n", if_ip);
 
     // check and resolve destination hostname
     char *hostname = argv[1];
     struct in_addr dest;
 
     if (0 != hostname_to_ip(hostname, &dest)) {
-        fprintf(stderr, "Unable to resolve destination host '%s'!\n", hostname);
+        fprintf(stderr, "unable to resolve destination host '%s'!\n", hostname);
         return 1;
     }
 
@@ -165,83 +236,27 @@ int main(int argc, char **argv) {
     printf("tracing down '%s' on '%s'..\n", hostname, ip);
 
     // finally bind raw socket, OUTBOUND
-    int on = 1; // we include headers in the packet
+    int on = 1; // include headers in the packet
     int out_sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (0 > out_sock) {
-        fprintf(stderr, "Error creating raw out-socket!\n");
+        fprintf(stderr, "error creating raw out-socket!\n");
         return -1;
     }
     if (0 != setsockopt(out_sock, IPPROTO_IP, IP_HDRINCL, (const char *) &on, sizeof(on))) {
-        fprintf(stderr, "Error setting out-socket options!\n");
+        fprintf(stderr, "error setting out-socket options!\n");
         return -1;
     }
 
     // bind raw socket, INBOUND
     int in_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (0 > in_sock) {
-        fprintf(stderr, "Error creating raw in-socket!\n");
+        fprintf(stderr, "error creating raw in-socket!\n");
         return -1;
     }
     if (0 != setsockopt(in_sock, IPPROTO_IP, IP_HDRINCL, (const char *) &on, sizeof(on))) {
-        fprintf(stderr, "Error setting in-socket options!\n");
+        fprintf(stderr, "error setting in-socket options!\n");
         return -1;
     }
 
-    // build traceroute span
-    struct trace_span span;
-    span.src = &src;
-    span.dest = &dest;
-
-    // destination socket address
-    struct sockaddr_in dest_sockaddr;
-    dest_sockaddr.sin_family = AF_INET;
-    dest_sockaddr.sin_addr.s_addr = dest.s_addr;
-    dest_sockaddr.sin_port = htons(80);
-
-    for (uint8_t i = 0; i < MAX_HOPS; i++) {
-        // upgrade span, create packet
-        span.ttl = i + 1;
-        char *packet = build_span(&span);
-
-        // send span
-        printf("Sending span %d..\n", span.ttl);
-        ssize_t dat = sendto(out_sock, packet, sizeof(struct iphdr) + sizeof(struct icmphdr) + sizeof(struct udphdr), 0,
-                             (struct sockaddr *) &dest_sockaddr, sizeof dest_sockaddr);
-        printf("Sent %d byte span\n", (int) dat);
-
-        free(packet);
-
-        // receive answer
-        struct sockaddr_in receiver;
-        socklen_t sockaddr_size = sizeof(receiver);
-        char buf[UINT16_MAX];
-        recvfrom(in_sock, buf, sizeof(struct iphdr) + sizeof(struct icmphdr), 0, (struct sockaddr *) &receiver,
-                 &sockaddr_size);
-        struct iphdr *ip = (struct iphdr *) buf;
-        struct icmphdr *icmp = (struct icmphdr *) (buf + sizeof(struct iphdr));
-
-        // "Translate" response ip
-        char res_ip[15];
-        inet_ntop(AF_INET, &ip->saddr, res_ip, sizeof(res_ip));
-
-        // Lookup hostname by response ip
-        struct sockaddr_in lkp;
-        memset(&lkp, 0, sizeof(lkp));
-        lkp.sin_family = AF_INET;
-        lkp.sin_addr.s_addr = ip->saddr;
-
-        static char hostname[65];
-        if (0 != getnameinfo((struct sockaddr *) &lkp, sizeof(lkp), hostname, sizeof(hostname), NULL, 0, 0)) {
-            strcpy(hostname, "*");
-        }
-
-        printf("Answer %d from [%s]: %s\n", span.ttl, hostname, res_ip);
-
-        if (0 == memcmp(&dest, &ip->saddr, sizeof(struct in_addr))) {
-            printf("Trace complete!\n");
-            i = MAX_HOPS;
-        }
-    }
-
-    return 0;
+    trace(out_sock, in_sock, &src, &dest);
 }
