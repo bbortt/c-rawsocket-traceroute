@@ -1,4 +1,4 @@
-programs = sort
+programs = traceroute
 CFLAGS = -O0 -g # -Wall
 
 all: $(programs)
